@@ -12,7 +12,11 @@ Main differences vs previous trig model
 ---------------------------------------
 1. Full-grid branch input is supported natively.
 2. Trunk uses PURE sine layers on raw (t, x1, x2), no Fourier features.
-3. Higher default capacity is expected in training script.
+3. Initial conditions are HARD-EMBEDDED:
+      u(t,x) = u0(x) + t v0(x) + t^2 D(x) * correction_theta(...)
+   so that automatically:
+      u(0,x)   = u0(x)
+      u_t(0,x)= v0(x)
 4. Same public interface:
       - forward(branch_input, trunk_input)
       - forward_with_grad(branch_input, trunk_input)
@@ -159,17 +163,25 @@ class TrunkNetTrig(nn.Module):
 
 class PIDeepONetTrigFullGrid(nn.Module):
     """
-    Pure-sine PI-DeepONet.
+    Pure-sine PI-DeepONet with HARD-EMBEDDED IC.
 
-    Hard Dirichlet BC on [0,1]^2:
+    Output structure:
+        u(t,x) = u0_interp(x) + t * v0_interp(x) + t^2 * D(x) * correction(t,x)
+
+    where
         D(x) = x1 (1-x1) x2 (1-x2)
-    so the predicted field is u = D(x) * u_hat.
+
+    Therefore:
+        u(0,x)    = u0(x)
+        u_t(0,x)  = v0(x)
     """
 
     def __init__(
         self,
         *,
         n_sensors: int,
+        Nx: int,
+        Ny: int,
         n_params: int = 5,
         hidden_dim: int = 512,
         p: int = 512,
@@ -178,8 +190,18 @@ class PIDeepONetTrigFullGrid(nn.Module):
         hidden_omega_0: float = 20.0,
     ) -> None:
         super().__init__()
+
+        if n_sensors != Nx * Ny:
+            raise ValueError(
+                f"Expected n_sensors = Nx * Ny for full-grid mode, "
+                f"but got n_sensors={n_sensors}, Nx*Ny={Nx*Ny}"
+            )
+
         self.n_sensors = n_sensors
+        self.Nx = Nx
+        self.Ny = Ny
         self.n_params = n_params
+
         branch_input_dim = 2 * n_sensors + n_params
 
         self.branch = BranchNetTrig(
@@ -206,11 +228,112 @@ class PIDeepONetTrigFullGrid(nn.Module):
         x2 = trunk_input[:, 2]
         return x1 * (1.0 - x1) * x2 * (1.0 - x2)
 
+    def _split_branch_input(
+        self,
+        branch_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        branch_input shape: [B, 2*n_sensors + n_params]
+        returns:
+            u0_grid:  [B, n_sensors]
+            v0_grid:  [B, n_sensors]
+            params:   [B, n_params]
+        """
+        ns = self.n_sensors
+        u0_grid = branch_input[:, :ns]
+        v0_grid = branch_input[:, ns:2 * ns]
+        params = branch_input[:, 2 * ns:]
+        return u0_grid, v0_grid, params
+
+    def _bilinear_interp_from_fullgrid(
+        self,
+        field_flat: torch.Tensor,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Bilinear interpolation on a regular interior grid:
+            x_i = i/(Nx+1), i=1,...,Nx
+            y_j = j/(Ny+1), j=1,...,Ny
+
+        Parameters
+        ----------
+        field_flat : [B, Nx*Ny]
+        x1, x2     : [B] in [0,1]
+
+        Returns
+        -------
+        values : [B]
+        """
+        B = field_flat.shape[0]
+        field = field_flat.view(B, self.Nx, self.Ny)
+
+        # Continuous index coordinates relative to interior grid
+        gx = x1 * (self.Nx + 1) - 1.0
+        gy = x2 * (self.Ny + 1) - 1.0
+
+        # Clamp to valid interpolation range
+        eps = 1e-6
+        gx = torch.clamp(gx, 0.0, self.Nx - 1.0 - eps)
+        gy = torch.clamp(gy, 0.0, self.Ny - 1.0 - eps)
+
+        i0 = torch.floor(gx).long()
+        j0 = torch.floor(gy).long()
+        i1 = i0 + 1
+        j1 = j0 + 1
+
+        i1 = torch.clamp(i1, max=self.Nx - 1)
+        j1 = torch.clamp(j1, max=self.Ny - 1)
+
+        wx = gx - i0.float()
+        wy = gy - j0.float()
+
+        batch_idx = torch.arange(B, device=field.device)
+
+        f00 = field[batch_idx, i0, j0]
+        f10 = field[batch_idx, i1, j0]
+        f01 = field[batch_idx, i0, j1]
+        f11 = field[batch_idx, i1, j1]
+
+        values = (
+            (1.0 - wx) * (1.0 - wy) * f00
+            + wx * (1.0 - wy) * f10
+            + (1.0 - wx) * wy * f01
+            + wx * wy * f11
+        )
+        return values
+
+    def _ic_embedded_terms(
+        self,
+        branch_input: torch.Tensor,
+        trunk_input: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns interpolated u0(x), v0(x) at the trunk spatial points.
+        """
+        u0_grid, v0_grid, _ = self._split_branch_input(branch_input)
+        x1 = trunk_input[:, 1]
+        x2 = trunk_input[:, 2]
+
+        u0_interp = self._bilinear_interp_from_fullgrid(u0_grid, x1, x2)
+        v0_interp = self._bilinear_interp_from_fullgrid(v0_grid, x1, x2)
+        return u0_interp, v0_interp
+
     def forward(self, branch_input: torch.Tensor, trunk_input: torch.Tensor) -> torch.Tensor:
+        # Hard-embedded initial conditions
+        u0_interp, v0_interp = self._ic_embedded_terms(branch_input, trunk_input)
+
+        tvals = trunk_input[:, 0]
+        bc = self._bc_factor(trunk_input)
+
+        # Learn only the correction term
         b = self.branch(branch_input)
-        t = self.trunk(trunk_input)
-        u_hat = torch.sum(b * t, dim=-1) + self.bias
-        return self._bc_factor(trunk_input) * u_hat
+        tr = self.trunk(trunk_input)
+        correction_hat = torch.sum(b * tr, dim=-1) + self.bias
+
+        correction = (tvals ** 2) * bc * correction_hat
+        u = u0_interp + tvals * v0_interp + correction
+        return u
 
     def forward_with_grad(
         self,
