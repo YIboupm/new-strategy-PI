@@ -6,7 +6,22 @@ train_pure_physics_trig_fullgrid.py
 ==================================
 
 High-capacity pure-physics PI-DeepONet training for FULL-GRID sensors.
-Optimized for strong CUDA GPUs such as H200 SXM.
+This version is adapted for the HARD-IC model:
+
+    u(t,x) = u0(x) + t v0(x) + t^2 D(x) * correction_theta(...)
+
+So:
+    u(0,x)   = u0(x)
+    u_t(0,x)= v0(x)
+
+Recommended training strategy
+-----------------------------
+Phase 1:
+    PDE only
+Phase 2:
+    PDE + semigroup
+Phase 3:
+    PDE + semigroup + mild amplitude regularization
 """
 
 from __future__ import annotations
@@ -96,6 +111,28 @@ def get_autocast_context(device: str, amp_dtype_name: str):
     return torch.amp.autocast(device_type="cuda", dtype=dtype)
 
 
+def load_checkpoint_robust(model: torch.nn.Module, ckpt_path: str | Path, device: str):
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    if isinstance(ckpt, dict) and "model_state" in ckpt:
+        state_dict = ckpt["model_state"]
+    else:
+        state_dict = ckpt
+
+    if any(k.startswith("_orig_mod.") for k in state_dict.keys()):
+        state_dict = {k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()}
+        print("Detected torch.compile checkpoint: stripped '_orig_mod.' prefix")
+
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Checkpoint does not match model.\n"
+            f"Missing keys: {missing}\n"
+            f"Unexpected keys: {unexpected}"
+        )
+    return ckpt
+
+
 class WaveDatasetFullGrid:
     def __init__(self, data_path: str, device: str = "cpu") -> None:
         self.device = device
@@ -142,6 +179,10 @@ class WaveDatasetFullGrid:
         return torch.cat([u0, v0, params], dim=1)
 
     def sample_ic_batch(self, batch_size: int, rng=None) -> Tuple[torch.Tensor, ...]:
+        """
+        Optional diagnostic batch only.
+        For hard-IC models, this is not needed as a main loss.
+        """
         if rng is None:
             rng = np.random.default_rng()
 
@@ -196,7 +237,11 @@ class WaveDatasetFullGrid:
         return branch, trunk, params_batch
 
 
-def build_branch_from_sensor_state(u_sensors: torch.Tensor, v_sensors: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+def build_branch_from_sensor_state(
+    u_sensors: torch.Tensor,
+    v_sensors: torch.Tensor,
+    params: torch.Tensor,
+) -> torch.Tensor:
     return torch.cat([u_sensors, v_sensors, params], dim=1)
 
 
@@ -271,7 +316,10 @@ def compute_loss_semigroup(
         rng.uniform(dt_min, dt_max, size=batch_size).astype(np.float32),
         device=dataset.device,
     )
-    t1_np = np.array([rng.uniform(0.0, max(T - float(dt), 1e-6)) for dt in dt_vals.detach().cpu().numpy()], dtype=np.float32)
+    t1_np = np.array(
+        [rng.uniform(0.0, max(T - float(dt), 1e-6)) for dt in dt_vals.detach().cpu().numpy()],
+        dtype=np.float32,
+    )
     t1_vals = torch.tensor(t1_np, device=dataset.device)
     t2_vals = t1_vals + dt_vals
 
@@ -424,6 +472,10 @@ def compute_loss_pde(model, branch_input, trunk_input, params_batch):
 
 
 def compute_loss_ic(model, branch_input, trunk_input, u0_target, v0_target):
+    """
+    Optional diagnostic consistency check only.
+    For hard-IC models this should normally be zero up to interpolation/numerics.
+    """
     derivs = model.forward_with_grad(branch_input, trunk_input)
     u_pred = derivs["u"]
     v_pred = derivs["u_t"]
@@ -499,21 +551,30 @@ def train(model, dataset, config):
 
     n_epochs = config["n_epochs"]
     stage = config.get("stage", "phase1")
+
     if stage == "phase1":
         if config["w_sg"] == 0.0:
             config["w_sg"] = 0.0
         if config["w_amp"] == 0.0:
-            config["w_amp"] = 50.0
+            config["w_amp"] = 0.0
+        if config["w_ic"] == 0.0:
+            config["w_ic"] = 0.0
+
     elif stage == "phase2":
         if config["w_sg"] == 0.0:
             config["w_sg"] = 0.01
         if config["w_amp"] == 0.0:
-            config["w_amp"] = 30.0
+            config["w_amp"] = 0.0
+        if config["w_ic"] == 0.0:
+            config["w_ic"] = 0.0
+
     elif stage == "phase3":
         if config["w_sg"] == 0.0:
-            config["w_sg"] = 0.02
+            config["w_sg"] = 0.01
         if config["w_amp"] == 0.0:
-            config["w_amp"] = 20.0
+            config["w_amp"] = 5.0
+        if config["w_ic"] == 0.0:
+            config["w_ic"] = 0.0
 
     w_pde = config["w_pde"]
     w_ic = config["w_ic"]
@@ -524,15 +585,12 @@ def train(model, dataset, config):
     if config.get("resume"):
         resume_path = Path(config["resume"])
         if resume_path.exists():
-            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            ckpt = load_checkpoint_robust(model, resume_path, device)
             if isinstance(ckpt, dict) and "model_state" in ckpt:
-                model.load_state_dict(ckpt["model_state"])
                 if "optimizer_state" in ckpt:
                     optimizer.load_state_dict(ckpt["optimizer_state"])
                 best_loss = ckpt.get("best_loss", best_loss)
                 start_epoch = ckpt.get("epoch", 0) + 1
-            else:
-                model.load_state_dict(ckpt)
             print(f"Resumed from epoch {start_epoch}")
 
     if config.get("curriculum", False):
@@ -544,7 +602,7 @@ def train(model, dataset, config):
         T_schedule = np.full(n_epochs, T_final)
 
     print(f"\n{'='*88}")
-    print("PURE PHYSICS TRAINING WITH TRIG MODEL — FULL GRID")
+    print("PURE PHYSICS TRAINING WITH TRIG MODEL — FULL GRID (HARD-IC)")
     print(f"{'='*88}")
     print(f"  Epochs: {n_epochs}")
     print(f"  T_final: {T_final}")
@@ -569,8 +627,13 @@ def train(model, dataset, config):
         T_curr = float(T_schedule[local_epoch - 1])
 
         with get_autocast_context(device, amp_dtype_name):
-            br_ic, tr_ic, u0_target, v0_target = dataset.sample_ic_batch(config["batch_ic"], rng=rng)
-            loss_ic, loss_u0, loss_v0 = compute_loss_ic(model, br_ic, tr_ic, u0_target, v0_target)
+            if w_ic > 0.0:
+                br_ic, tr_ic, u0_target, v0_target = dataset.sample_ic_batch(config["batch_ic"], rng=rng)
+                loss_ic, loss_u0, loss_v0 = compute_loss_ic(model, br_ic, tr_ic, u0_target, v0_target)
+            else:
+                loss_ic = torch.tensor(0.0, device=device)
+                loss_u0 = torch.tensor(0.0, device=device)
+                loss_v0 = torch.tensor(0.0, device=device)
 
             br_pde, tr_pde, params_pde = dataset.sample_pde_batch(
                 config["batch_pde"],
@@ -725,7 +788,7 @@ def train(model, dataset, config):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train full-grid pure-physics trig PI-DeepONet")
+    parser = argparse.ArgumentParser(description="Train full-grid pure-physics trig PI-DeepONet (hard-IC)")
     parser.add_argument("--data", type=str, default="wave_data_v2.npz")
     parser.add_argument("--output_dir", type=str, default="results_pure_physics_trig_fullgrid")
     parser.add_argument("--save_name", type=str, default="best_pure_physics_trig_fullgrid.pt")
@@ -765,7 +828,7 @@ def main():
     parser.add_argument("--amp_velocity_weight", type=float, default=0.25)
 
     parser.add_argument("--w_pde", type=float, default=1.0)
-    parser.add_argument("--w_ic", type=float, default=1000.0)
+    parser.add_argument("--w_ic", type=float, default=0.0)
 
     parser.add_argument("--T", type=float, default=30.0)
     parser.add_argument("--curriculum", action="store_true")
@@ -784,7 +847,12 @@ def main():
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--cudnn_benchmark", action="store_true")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--compile_mode", type=str, default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+    )
 
     args = parser.parse_args()
     device = get_best_device(args.device)
@@ -794,6 +862,8 @@ def main():
     dataset = WaveDatasetFullGrid(data_path=args.data, device=device)
     model = PIDeepONetTrigFullGrid(
         n_sensors=dataset.n_sensors,
+        Nx=dataset.Nx,
+        Ny=dataset.Ny,
         n_params=5,
         hidden_dim=args.hidden_dim,
         p=args.p,
@@ -803,8 +873,8 @@ def main():
     ).to(device)
     model = maybe_compile_model(model, args, device)
 
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Device: {device}, Params: {n_params:,}")
+    n_params_model = sum(p.numel() for p in model.parameters())
+    print(f"Device: {device}, Params: {n_params_model:,}")
 
     config = vars(args)
     history, _ = train(model, dataset, config)
